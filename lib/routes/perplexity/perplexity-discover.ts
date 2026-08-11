@@ -1,103 +1,112 @@
-import { load } from 'cheerio';
 import type { Context } from 'hono';
+
 import type { Data, DataItem, Route } from '@/types';
 import { ViewType } from '@/types';
-import cache from '@/utils/cache';
 import logger from '@/utils/logger';
-import { getPlaywrightPage } from '@/utils/playwright';
 
 export const handler = async (ctx: Context): Promise<Data> => {
     const limit = Number(ctx.req.query('limit') ?? '20');
     const targetUrl = 'https://www.perplexity.ai/discover';
 
-    logger.http(`Fetching Perplexity Discover from ${targetUrl}`);
+    logger.http(`Fetching Perplexity Discover via Jina AI Reader from ${targetUrl}`);
 
-    const { page, destroy, context } = await getPlaywrightPage(targetUrl, {
-        onBeforeLoad: async (page) => {
-            await page.route('**/*', (route) => {
-                const request = route.request();
-                request.resourceType() === 'document' ? route.continue() : route.abort();
-            });
+    // 使用 Jina AI Reader API 繞過 Cloudflare
+    const jinaUrl = `https://r.jina.ai/${targetUrl}`;
+
+    const response = await fetch(jinaUrl, {
+        headers: {
+            'X-With-Generated-Alt': 'true',
+            'X-Return-Format': 'markdown',
         },
-        antiCrawler: true,
     });
 
-    await page.waitForTimeout(5000);
+    if (!response.ok) {
+        logger.error(`Jina AI Reader failed: ${response.status} ${response.statusText}`);
+        return {
+            title: 'Perplexity Discover',
+            link: targetUrl,
+            description: 'Failed to fetch Perplexity Discover',
+            item: [],
+        };
+    }
 
-    const html = await page.evaluate(() => document.documentElement.getHTML());
-    const $ = load(html);
-    const language = $('html').attr('lang') ?? 'en';
+    const markdown = await response.text();
+    logger.http(`Jina AI Reader returned ${markdown.length} characters`);
 
+    // 解析 markdown，提取文章連結
+    // 格式: [...content...](https://www.perplexity.ai/discover/top/slug)
     const items: DataItem[] = [];
     const seenLinks = new Set<string>();
 
-    const links = $('a[href]').toArray();
+    // 匹配文章連結 - 找到所有包含 discover/top 的連結
+    const linkRegex = /\[([^\]]+)\]\((https:\/\/www\.perplexity\.ai\/discover\/top\/[^)]+)\)/g;
+    let match;
 
-    for (const elem of links) {
-        const $link = $(elem);
-        const href = $link.attr('href');
-        if (!href) continue;
-        if (!href.includes('perplexity.ai')) continue;
-        if (href.startsWith('http') === false && !href.startsWith('/')) continue;
+    while ((match = linkRegex.exec(markdown)) !== null) {
+        const content = match[1];
+        const link = match[2];
 
-        const fullLink = href.startsWith('http') ? href : `https://www.perplexity.ai${href}`;
-        if (seenLinks.has(fullLink)) continue;
-        if (fullLink === targetUrl) continue;
+        if (!link || seenLinks.has(link)) continue;
+        if (link === targetUrl) continue;
 
-        const titleEl = $link.find('h1, h2, h3, h4, [data-framer-name="Title"]').first();
-        const title = titleEl.text().trim() || $link.text().trim().substring(0, 100);
+        seenLinks.add(link);
+
+        // 從 content 中提取標題
+        // 格式: ![Image N: TITLE](url) TITLE Published X hours ago SUMMARY ... N sources
+        const titleMatch = content.match(/!\[Image \d+: ([^\]]+)\]\(/);
+        const rawTitle = titleMatch ? titleMatch[1] : '';
+
+        // 嘗試從第一個非圖片的文本中提取標題
+        const textWithoutImages = content.replace(/!\[.*?\]\(.*?\)/g, '').trim();
+        const textLines = textWithoutImages.split(/\s+/).filter(line => line.length > 0);
+
+        // 標題通常在第一個 "Published" 之前
+        let title = '';
+        let summary = '';
+        let pubDate = '';
+
+        for (let i = 0; i < textLines.length; i++) {
+            const line = textLines[i];
+            if (line.match(/^Published$/i) || line.match(/^\d+\s*hours?\s*ago$/i) || line.match(/^Aug|Jul|Jun/)) {
+                // 找到日期，之前的是標題
+                title = textLines.slice(0, i).join(' ');
+                // 之後的是摘要
+                summary = textLines.slice(i + 1).join(' ').replace(/\d+\s*sources?/gi, '').trim();
+                break;
+            }
+        }
+
+        if (!title) {
+            // fallback: 使用 rawTitle 或第一行
+            title = rawTitle || textLines[0]?.substring(0, 100) || 'Perplexity Discover';
+        }
+
+        // 清理標題
+        title = title
+            .replace(/Published\s+\d+\s*(hours?|days?)/gi, '')
+            .replace(/Published\s+(Aug|Jul|Jun|May|Apr|Mar|Feb|Jan)\s+\d+,\s*\d{4}/gi, '')
+            .replace(/\s+/g, ' ')
+            .trim();
+
         if (!title || title.length < 3) continue;
 
-        const summaryEl = $link.find('p, [data-framer-name="Description"], [data-framer-name="Summary"]').first();
-        const summary = summaryEl.text().trim().substring(0, 300);
-
-        seenLinks.add(fullLink);
         items.push({
             title,
-            description: summary,
-            link: fullLink,
-            guid: `perplexity-discover-${fullLink}`,
-            id: `perplexity-discover-${fullLink}`,
+            description: summary || '',
+            link,
+            guid: `perplexity-discover-${link}`,
+            id: `perplexity-discover-${link}`,
         });
     }
 
-    const resultItems = await Promise.all(
-        items.slice(0, limit).map(async (item) => {
-            if (!item.link) return item;
-            return await cache.tryGet(item.link, async () => {
-                const contentPage = await context.newPage();
-                await contentPage.route('**/*', (route) => {
-                    const request = route.request();
-                    request.resourceType() === 'document' ? route.continue() : route.abort();
-                });
-                try {
-                    await contentPage.goto(item.link!, { waitUntil: 'domcontentloaded', timeout: 15000 });
-                    await contentPage.waitForTimeout(2000);
-                    const contentHtml = await contentPage.evaluate(() => document.documentElement.getHTML());
-                    const $content = load(contentHtml);
-                    const articleContent = $content('div#main > div > div > div[data-framer-component-type="RichTextContainer"]').first();
-                    if (articleContent.length) {
-                        item.description = articleContent.html()?.trim() || item.description;
-                    }
-                } catch (e) {
-                    logger.error(`Failed to fetch ${item.link}: ${e.message}`);
-                }
-                await contentPage.close();
-                return item;
-            }, 3600, false);
-        })
-    );
-
-    await destroy();
+    logger.http(`Found ${items.length} items`);
 
     return {
-        title: $('title').text() || 'Perplexity Discover',
-        description: $('meta[name="description"], meta[property="og:description"]').first().attr('content') || 'Trending topics and news from Perplexity',
+        title: 'Perplexity Discover',
         link: targetUrl,
-        item: resultItems,
+        description: 'Trending topics and news from Perplexity',
+        item: items.slice(0, limit),
         allowEmpty: true,
-        image: $('meta[property="og:image"]').attr('content'),
-        language: language as 'en',
     };
 };
 
@@ -112,8 +121,8 @@ export const route: Route = {
     categories: ['news'],
     features: {
         requireConfig: false,
-        requirePuppeteer: true,
-        antiCrawler: true,
+        requirePuppeteer: false, // 不需要 Puppeteer！
+        antiCrawler: false,
         supportRadar: true,
         supportBT: false,
         supportPodcast: false,
